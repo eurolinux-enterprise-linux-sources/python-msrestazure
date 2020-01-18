@@ -20,12 +20,12 @@
 %global bundled_lib_dir    bundled
 %global keyring_dir        %{bundled_lib_dir}/keyring
 
-%global adal_min_version 0.4.0
-%global msrest_min_version 0.4.17
+%global adal_min_version 0.6.0
+%global msrest_min_version 0.5.4
 
 Name:           python-%{srcname}
-Version:        0.4.16
-Release:        3%{?dist}
+Version:        0.5.1
+Release:        0%{?dist}.1
 Summary:        %{common_summary}
 
 Group:          System Environment/Libraries
@@ -33,8 +33,6 @@ License:        MIT and Python
 URL:            https://github.com/Azure/msrestazure-for-python/
 Source0:        https://github.com/Azure/msrestazure-for-python/archive/v%{version}/%{srcname}-%{version}.tar.gz
 Source1:        https://pypi.io/packages/source/k/keyring/keyring-%{keyring_version}.tar.gz
-# Fix install_requires option, for EPEL especially
-Patch0:         %{name}-0.4.15-build.patch
 
 BuildRequires:  python-setuptools
 BuildRequires:  python-devel
@@ -145,6 +143,10 @@ popd
 
 
 %changelog
+* Thu May 16 2019 Oyvind Albrigtsen <oalbrigt@redhat.com> - 0.5.1-0.1
+- Update to 0.5.1
+  Resolves: rhbz#1709114
+
 * Thu Jan 25 2018 Oyvind Albrigtsen <oalbrigt@redhat.com> - 0.4.16-3
 - Bundle python-keyring
 - Append python-keyring bundled directory to search path where needed

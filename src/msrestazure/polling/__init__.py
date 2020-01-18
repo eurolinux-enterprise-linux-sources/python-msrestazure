@@ -1,4 +1,4 @@
-﻿# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 #
 # Copyright (c) Microsoft Corporation. All rights reserved.
 #
@@ -23,6 +23,3 @@
 # IN THE SOFTWARE.
 #
 # --------------------------------------------------------------------------
-
-#: version of the package. Use msrestazure.__version__ instead.
-msrestazure_version = "0.5.1"

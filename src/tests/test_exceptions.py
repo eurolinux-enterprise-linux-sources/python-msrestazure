@@ -1,6 +1,6 @@
 ﻿#--------------------------------------------------------------------------
 #
-# Copyright (c) Microsoft Corporation. All rights reserved. 
+# Copyright (c) Microsoft Corporation. All rights reserved.
 #
 # The MIT License (MIT)
 #
@@ -26,15 +26,11 @@
 
 import json
 import unittest
-try:
-    from unittest import mock
-except ImportError:
-    import mock
 
 from requests import Response, RequestException
 
 from msrest import Deserializer, Configuration
-from msrestazure.azure_exceptions import CloudErrorData, CloudError
+from msrestazure.azure_exceptions import CloudErrorData, CloudError, TypedErrorInfo
 
 
 class TestCloudException(unittest.TestCase):
@@ -42,7 +38,10 @@ class TestCloudException(unittest.TestCase):
     def setUp(self):
         self.cfg = Configuration("https://my_endpoint.com")
         self._d = Deserializer()
-        self._d.dependencies = {'CloudErrorData': CloudErrorData}
+        self._d.dependencies = {
+            'CloudErrorData': CloudErrorData,
+            'TypedErrorInfo': TypedErrorInfo
+        }
         return super(TestCloudException, self).setUp()
 
     def test_cloud_exception(self):
@@ -110,17 +109,78 @@ class TestCloudException(unittest.TestCase):
                     "target": "$search",
                     "message": "$search query option not supported",
                 }
+            ],
+            "innererror": {
+                "customKey": "customValue"
+            },
+            "additionalInfo": [
+                {
+                    "type": "SomeErrorType",
+                    "info": {
+                        "customKey": "customValue"
+                    }
+                }
             ]
         }
         cloud_exp = self._d(CloudErrorData(), message)
         self.assertEqual(cloud_exp.target, 'query')
         self.assertEqual(cloud_exp.details[0].target, '$search')
+        self.assertEqual(cloud_exp.innererror['customKey'], 'customValue')
+        self.assertEqual(cloud_exp.additionalInfo[0].type, 'SomeErrorType')
+        self.assertEqual(cloud_exp.additionalInfo[0].info['customKey'], 'customValue')
+        self.assertIn('customValue', str(cloud_exp))
 
+        message = {
+            "code": "BadArgument",
+            "message": "The provided database 'foo' has an invalid username.",
+            "target": "query",
+            "details": [
+                {
+                    "code": "301",
+                    "target": "$search",
+                    "message": "$search query option not supported",
+                    "additionalInfo": [
+                        {
+                            "type": "PolicyViolation",
+                            "info": {
+                                "policyDefinitionDisplayName": "Allowed locations",
+                                "policyAssignmentParameters": {
+                                    "listOfAllowedLocations": {
+                                        "value": [
+                                            "westus"
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            ],
+            "additionalInfo": [
+                {
+                    "type": "SomeErrorType",
+                    "info": {
+                        "customKey": "customValue"
+                    }
+                }
+            ]
+        }
+        cloud_exp = self._d(CloudErrorData(), message)
+        self.assertEqual(cloud_exp.target, 'query')
+        self.assertEqual(cloud_exp.details[0].target, '$search')
+        self.assertEqual(cloud_exp.additionalInfo[0].type, 'SomeErrorType')
+        self.assertEqual(cloud_exp.additionalInfo[0].info['customKey'], 'customValue')
+        self.assertEqual(cloud_exp.details[0].additionalInfo[0].type, 'PolicyViolation')
+        self.assertEqual(cloud_exp.details[0].additionalInfo[0].info['policyDefinitionDisplayName'], 'Allowed locations')
+        self.assertEqual(cloud_exp.details[0].additionalInfo[0].info['policyAssignmentParameters']['listOfAllowedLocations']['value'][0], 'westus')
+        self.assertIn('customValue', str(cloud_exp))
 
 
     def test_cloud_error(self):
 
-        response = mock.create_autospec(Response)
+        response = Response()
+        response._content = br'{"real": true}'  # Has to be valid bytes JSON
+        response._content_consumed = True
         response.status_code = 400
         response.headers = {"content-type": "application/json; charset=utf8"}
         response.reason = 'BadRequest'
@@ -131,11 +191,12 @@ class TestCloudException(unittest.TestCase):
             'values': {'invalid_attribute':'data'}
             }}
 
-        response.text = json.dumps(message)
-        response.json = lambda: json.loads(response.text)
+        response._content = json.dumps(message).encode("utf-8")
+
         error = CloudError(response)
         self.assertEqual(error.message, 'Bad Request')
         self.assertEqual(error.status_code, 400)
+        self.assertIsInstance(error.response, Response)
         self.assertIsInstance(error.error, CloudErrorData)
 
         error = CloudError(response, "Request failed with bad status")
@@ -143,33 +204,33 @@ class TestCloudException(unittest.TestCase):
         self.assertEqual(error.status_code, 400)
         self.assertIsInstance(error.error, Response)
 
-        response.text = "{"
+        response._content = b"{{"
         error = CloudError(response)
-        self.assertTrue("none" in error.message)
+        self.assertIn("None", error.message)
 
-        response.text = json.dumps({'message':'server error'})
+        response._content = json.dumps({'message':'server error'}).encode("utf-8")
         error = CloudError(response)
         self.assertTrue("server error" in error.message)
         self.assertEqual(error.status_code, 400)
 
-        response.text = "{"
-        response.raise_for_status.side_effect = RequestException("FAILED!")
+        response._content = b"{{"
+        response.reason = "FAILED!"
         error = CloudError(response)
         self.assertTrue("FAILED!" in error.message)
         self.assertIsInstance(error.error, RequestException)
 
-        response.raise_for_status.side_effect = None
+        response.reason = 'BadRequest'
 
-        response.text = '{\r\n  "odata.metadata":"https://account.region.batch.azure.com/$metadata#Microsoft.Azure.Batch.Protocol.Entities.Container.errors/@Element","code":"InvalidHeaderValue","message":{\r\n    "lang":"en-US","value":"The value for one of the HTTP headers is not in the correct format.\\nRequestId:5f4c1f05-603a-4495-8e80-01f776310bbd\\nTime:2016-01-04T22:12:33.9245931Z"\r\n  },"values":[\r\n    {\r\n      "key":"HeaderName","value":"Content-Type"\r\n    },{\r\n      "key":"HeaderValue","value":"application/json; odata=minimalmetadata; charset=utf-8"\r\n    }\r\n  ]\r\n}'
+        response._content = b'{\r\n  "odata.metadata":"https://account.region.batch.azure.com/$metadata#Microsoft.Azure.Batch.Protocol.Entities.Container.errors/@Element","code":"InvalidHeaderValue","message":{\r\n    "lang":"en-US","value":"The value for one of the HTTP headers is not in the correct format.\\nRequestId:5f4c1f05-603a-4495-8e80-01f776310bbd\\nTime:2016-01-04T22:12:33.9245931Z"\r\n  },"values":[\r\n    {\r\n      "key":"HeaderName","value":"Content-Type"\r\n    },{\r\n      "key":"HeaderValue","value":"application/json; odata=minimalmetadata; charset=utf-8"\r\n    }\r\n  ]\r\n}'
         error = CloudError(response)
         self.assertIn("The value for one of the HTTP headers is not in the correct format", error.message)
 
-        response.text = '{"error":{"code":"Conflict","message":"The maximum number of Free ServerFarms allowed in a Subscription is 10.","target":null,"details":[{"message":"The maximum number of Free ServerFarms allowed in a Subscription is 10."},{"code":"Conflict"},{"errorentity":{"code":"Conflict","message":"The maximum number of Free ServerFarms allowed in a Subscription is 10.","extendedCode":"59301","messageTemplate":"The maximum number of {0} ServerFarms allowed in a Subscription is {1}.","parameters":["Free","10"],"innerErrors":null}}],"innererror":null}}'
+        response._content = b'{"error":{"code":"Conflict","message":"The maximum number of Free ServerFarms allowed in a Subscription is 10.","target":null,"details":[{"message":"The maximum number of Free ServerFarms allowed in a Subscription is 10."},{"code":"Conflict"},{"errorentity":{"code":"Conflict","message":"The maximum number of Free ServerFarms allowed in a Subscription is 10.","extendedCode":"59301","messageTemplate":"The maximum number of {0} ServerFarms allowed in a Subscription is {1}.","parameters":["Free","10"],"innerErrors":null}}],"innererror":null}}'
         error = CloudError(response)
         self.assertIsInstance(error.error, CloudErrorData)
         self.assertEqual(error.error.error, "Conflict")
 
-        response.text = json.dumps({
+        response._content = json.dumps({
             "error": {
                 "code": "BadArgument",
                 "message": "The provided database 'foo' has an invalid username.",
@@ -181,13 +242,13 @@ class TestCloudException(unittest.TestCase):
                         "message": "$search query option not supported",
                     }
                 ]
-            }})
+            }}).encode('utf-8')
         error = CloudError(response)
         self.assertIsInstance(error.error, CloudErrorData)
         self.assertEqual(error.error.error, "BadArgument")
 
         # See https://github.com/Azure/msrestazure-for-python/issues/54
-        response.text = '"{\\"error\\": {\\"code\\": \\"ResourceGroupNotFound\\", \\"message\\": \\"Resource group \'res_grp\' could not be found.\\"}}"'
+        response._content = b'"{\\"error\\": {\\"code\\": \\"ResourceGroupNotFound\\", \\"message\\": \\"Resource group \'res_grp\' could not be found.\\"}}"'
         error = CloudError(response)
         self.assertIn(response.text, error.message)
 

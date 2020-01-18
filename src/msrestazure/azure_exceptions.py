@@ -24,6 +24,8 @@
 #
 # --------------------------------------------------------------------------
 
+import json
+
 from requests import RequestException
 
 from msrest.exceptions import ClientException
@@ -51,6 +53,8 @@ class CloudErrorData(object):
         'message': {'key': 'message', 'type': 'str'},
         'target': {'key': 'target', 'type': 'str'},
         'details': {'key': 'details', 'type': '[CloudErrorData]'},
+        'innererror': {'key': 'innererror', 'type': 'object'},
+        'additionalInfo': {'key': 'additionalInfo', 'type': '[TypedErrorInfo]'},
         'data': {'key': 'values', 'type': '{str}'}
         }
 
@@ -61,6 +65,8 @@ class CloudErrorData(object):
         self.error_time = None
         self.target = kwargs.get('target')
         self.details = kwargs.get('details')
+        self.innererror = kwargs.get('innererror')
+        self.additionalInfo = kwargs.get('additionalInfo')
         self.data = kwargs.get('data')
         super(CloudErrorData, self).__init__(*args)
 
@@ -83,7 +89,20 @@ class CloudErrorData(object):
             for error_obj in self.details:
                 error_str += "\n\tError Code: {}".format(error_obj.error)
                 error_str += "\n\tMessage: {}".format(error_obj.message)
-                error_str += "\n\tTarget: {}".format(error_obj.target)
+                if error_obj.target:
+                    error_str += "\n\tTarget: {}".format(error_obj.target)
+                if error_obj.innererror:
+                    error_str += "\nInner error: {}".format(json.dumps(error_obj.innererror, indent=4))
+                if error_obj.additionalInfo:
+                    error_str += "\n\tAdditional Information:"
+                    for error_info in error_obj.additionalInfo:
+                        error_str += "\n\t\t{}".format(str(error_info).replace("\n", "\n\t\t"))
+        if self.innererror:
+            error_str += "\nInner error: {}".format(json.dumps(self.innererror, indent=4))
+        if self.additionalInfo:
+            error_str += "\nAdditional Information:"
+            for error_info in self.additionalInfo:
+                error_str += "\n\t{}".format(str(error_info).replace("\n", "\n\t"))
         error_bytes = error_str.encode()
         return error_bytes.decode('ascii')
 
@@ -102,8 +121,9 @@ class CloudErrorData(object):
         error data.
         """
         try:
-            value = eval(value)
-        except (SyntaxError, TypeError):
+            import ast
+            value = ast.literal_eval(value)
+        except (SyntaxError, TypeError, ValueError):
             pass
         try:
             value = value.get('value', value)
@@ -133,7 +153,8 @@ class CloudError(ClientException):
     def __init__(self, response, error=None, *args, **kwargs):
         self.deserializer = Deserializer({
             'CloudErrorRoot': CloudErrorRoot,
-            'CloudErrorData': CloudErrorData
+            'CloudErrorData': CloudErrorData,
+            'TypedErroInfo': TypedErrorInfo
         })
         self.error = None
         self.message = None
@@ -147,9 +168,9 @@ class CloudError(ClientException):
         else:
             self._build_error_data(response)
 
-        if not self.error or not self.message:
-            self._build_error_message(response)
- 
+            if not self.error or not self.message:
+                self._build_error_message(response)
+
         super(CloudError, self).__init__(
             self.message, self.error, *args, **kwargs)
 
@@ -163,6 +184,9 @@ class CloudError(ClientException):
         try:
             self.error = self.deserializer('CloudErrorRoot', response).error
         except DeserializationError:
+            self.error = None
+        except AttributeError:
+            # So far seen on Autorest test server only.
             self.error = None
         else:
             if self.error:
@@ -205,3 +229,25 @@ class CloudError(ClientException):
                 msg = "Operation failed with status: {!r}. Details: {}"
                 self.message = msg.format(
                     response.status_code, message)
+
+class TypedErrorInfo(object):
+    """Typed Error Info object, deserialized from error data returned
+    during a failed REST API call. Contains additional error information
+    """
+
+    _validation = {}
+    _attribute_map = {
+        'type': {'key': 'type', 'type': 'str'},
+        'info': {'key': 'info', 'type': 'object'}
+        }
+
+    def __init__(self, type, info):
+        self.type = type
+        self.info = info
+
+    def __str__(self):
+        """Cloud error message."""
+        error_str = "Type: {}".format(self.type)
+        error_str += "\nInfo: {}".format(json.dumps(self.info, indent=4))
+        error_bytes = error_str.encode()
+        return error_bytes.decode('ascii')

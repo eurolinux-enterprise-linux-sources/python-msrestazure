@@ -1,4 +1,4 @@
-﻿# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 #
 # Copyright (c) Microsoft Corporation. All rights reserved.
 #
@@ -23,24 +23,25 @@
 # IN THE SOFTWARE.
 #
 # --------------------------------------------------------------------------
-
 import re
-import threading
 import time
-import uuid
 try:
     from urlparse import urlparse
 except ImportError:
     from urllib.parse import urlparse
 
 from msrest.exceptions import DeserializationError, ClientException
-from msrestazure.azure_exceptions import CloudError
+from msrest.polling import PollingMethod
+
+from ..azure_exceptions import CloudError
 
 
 FINISHED = frozenset(['succeeded', 'canceled', 'failed'])
 FAILED = frozenset(['canceled', 'failed'])
 SUCCEEDED = frozenset(['succeeded'])
 
+_AZURE_ASYNC_OPERATION_FINAL_STATE = "azure-async-operation"
+_LOCATION_FINAL_STATE = "location"
 
 def finished(status):
     if hasattr(status, 'value'):
@@ -60,6 +61,17 @@ def succeeded(status):
     return str(status).lower() in SUCCEEDED
 
 
+class BadStatus(Exception):
+    pass
+
+
+class BadResponse(Exception):
+    pass
+
+
+class OperationFailed(Exception):
+    pass
+
 def _validate(url):
     """Validate a url.
 
@@ -72,7 +84,7 @@ def _validate(url):
     if not parsed.scheme or not parsed.netloc:
         raise ValueError("Invalid URL header")
 
-def _get_header_url(response, header_name):
+def get_header_url(response, header_name):
     """Get a URL from a header requests.
 
     :param requests.Response response: REST call response.
@@ -87,51 +99,31 @@ def _get_header_url(response, header_name):
     else:
         return url
 
-class BadStatus(Exception):
-    pass
-
-
-class BadResponse(Exception):
-    pass
-
-
-class OperationFailed(Exception):
-    pass
-
-
-class SimpleResource:
-    """An implementation of Python 3 SimpleNamespace.
-    Used to deserialize resource objects from response bodies where
-    no particular object type has been specified.
-    """
-
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-    def __repr__(self):
-        keys = sorted(self.__dict__)
-        items = ("{}={!r}".format(k, self.__dict__[k]) for k in keys)
-        return "{}({})".format(type(self).__name__, ", ".join(items))
-
-    def __eq__(self, other):
-        return self.__dict__ == other.__dict__
-
 
 class LongRunningOperation(object):
     """LongRunningOperation
     Provides default logic for interpreting operation responses
     and status updates.
-    """
-    _convert = re.compile('([a-z0-9])([A-Z])')
 
-    def __init__(self, response, outputs):
+    :param requests.Response response: The initial response.
+    :param callable deserialization_callback: The deserialization callaback.
+    :param dict lro_options: LRO options.
+    :param kwargs: Unused for now
+    """
+
+    def __init__(self, response, deserialization_callback, lro_options=None, **kwargs):
         self.method = response.request.method
+        self.initial_response = response
         self.status = ""
         self.resource = None
-        self.get_outputs = outputs
+        self.deserialization_callback = deserialization_callback
         self.async_url = None
         self.location_url = None
-        self.initial_status_code = None
+        if lro_options is None:
+            lro_options = {
+                'final-state-via': _AZURE_ASYNC_OPERATION_FINAL_STATE
+            }
+        self.lro_options = lro_options
 
     def _raise_if_bad_http_status_and_method(self, response):
         """Check response status code is valid for a Put or Patch
@@ -168,26 +160,7 @@ class LongRunningOperation(object):
 
         :param requests.Response response: latest REST call response.
         """
-        # Hacking response with initial status_code
-        previous_status = response.status_code
-        response.status_code = self.initial_status_code
-        resource = self.get_outputs(response)
-        response.status_code = previous_status
-
-        # Hack for Storage or SQL, to workaround the bug in the Python generator
-        if resource is None:
-            previous_status = response.status_code
-            for status_code_to_test in [200, 201]:
-                try:
-                    response.status_code = status_code_to_test
-                    resource = self.get_outputs(response)
-                except ClientException:
-                    pass
-                else:
-                    return resource
-                finally:
-                    response.status_code = previous_status
-        return resource
+        return self.deserialization_callback(response)
 
     def _get_async_status(self, response):
         """Attempt to find status info in response body.
@@ -218,8 +191,8 @@ class LongRunningOperation(object):
         :param requests.Response response: latest REST call response.
         :rtype: bool
         """
-        return (self.async_url or not self.resource) and \
-                self.method in {'PUT', 'PATCH'}
+        return ((self.async_url or not self.resource) and self.method in {'PUT', 'PATCH'}) \
+                or (self.lro_options['final-state-via'] == _LOCATION_FINAL_STATE and self.location_url and self.async_url and self.method == 'POST')
 
     def set_initial_status(self, response):
         """Process first response after initiating long running
@@ -233,14 +206,13 @@ class LongRunningOperation(object):
             self.resource = None
         else:
             try:
-                self.resource = self.get_outputs(response)
+                self.resource = self._deserialize(response)
             except DeserializationError:
                 self.resource = None
 
         self.set_async_url_if_present(response)
 
         if response.status_code in {200, 201, 202, 204}:
-            self.initial_status_code = response.status_code
             if self.async_url or self.location_url or response.status_code == 202:
                 self.status = 'InProgress'
             elif response.status_code == 201:
@@ -290,7 +262,17 @@ class LongRunningOperation(object):
         status = self._get_provisioning_state(response)
         self.status = status or 'Succeeded'
 
-        self.resource = self._deserialize(response)
+        self.parse_resource(response)
+
+    def parse_resource(self, response):
+        """Assuming this response is a resource, use the deserialization callback to parse it.
+        If body is empty, assuming no resource to return.
+        """
+        self._raise_if_bad_http_status_and_method(response)
+        if not self._is_empty(response):
+            self.resource = self._deserialize(response)
+        else:
+            self.resource = None
 
     def get_status_from_async(self, response):
         """Process the latest status update retrieved from a
@@ -317,97 +299,116 @@ class LongRunningOperation(object):
         #},
         # So try to parse it
         try:
-            self.resource = self.get_outputs(response)
+            self.resource = self._deserialize(response)
         except Exception:
             self.resource = None
 
     def set_async_url_if_present(self, response):
-        async_url = _get_header_url(response, 'azure-asyncoperation')
+        async_url = get_header_url(response, 'azure-asyncoperation')
         if async_url:
             self.async_url = async_url
-        
-        location_url = _get_header_url(response, 'location')
+        location_url = get_header_url(response, 'location')
         if location_url:
             self.location_url = location_url
 
+    def get_status_link(self):
+        if self.async_url:
+            return self.async_url
+        elif self.location_url:
+            return self.location_url
+        elif self.method == "PUT":
+            return self.initial_response.request.url
+        else:
+            raise BadResponse("Unable to find a valid status link for polling")
 
-class AzureOperationPoller(object):
-    """Initiates long running operation and polls status in separate
-    thread.
 
-    This class is used in old SDK and has been replaced. See "polling"
-    submodule now.
+class ARMPolling(PollingMethod):
 
-    :param callable send_cmd: The API request to initiate the operation.
-    :param callable update_cmd: The API reuqest to check the status of
-        the operation.
-    :param callable output_cmd: The function to deserialize the resource
-        of the operation.
-    :param int timeout: Time in seconds to wait between status calls,
-        default is 30.
-    """
-
-    def __init__(self, send_cmd, output_cmd, update_cmd, timeout=30):
+    def __init__(self, timeout=30, lro_options=None, **operation_config):
         self._timeout = timeout
-        self._callbacks = []
+        self._operation = None # Will hold an instance of LongRunningOperation
+        self._response = None  # Will hold latest received response
+        self._operation_config = operation_config
+        self._lro_options = lro_options
 
+    def status(self):
+        """Return the current status as a string.
+        :rtype: str
+        """
+        if not self._operation:
+            raise ValueError("set_initial_status was never called. Did you give this instance to a poller?")
+        return self._operation.status
+
+    def finished(self):
+        """Is this polling finished?
+        :rtype: bool
+        """
+        return finished(self.status())
+
+    def resource(self):
+        """Return the built resource.
+        """
+        return self._operation.resource
+
+    def initialize(self, client, initial_response, deserialization_callback):
+        """Set the initial status of this LRO.
+
+        :param initial_response: The initial response of the poller
+        :raises: CloudError if initial status is incorrect LRO state
+        """
+        self._client = client
+        self._response = initial_response
+        self._operation = LongRunningOperation(initial_response, deserialization_callback, self._lro_options)
         try:
-            self._response = send_cmd()
-            self._operation = LongRunningOperation(self._response, output_cmd)
-            self._operation.set_initial_status(self._response)
+            self._operation.set_initial_status(initial_response)
+        except BadStatus:
+            self._operation.status = 'Failed'
+            raise CloudError(initial_response)
+        except BadResponse as err:
+            self._operation.status = 'Failed'
+            raise CloudError(initial_response, str(err))
+        except OperationFailed:
+            raise CloudError(initial_response)
+
+    def run(self):
+        try:
+            self._poll()
         except BadStatus:
             self._operation.status = 'Failed'
             raise CloudError(self._response)
+
         except BadResponse as err:
             self._operation.status = 'Failed'
             raise CloudError(self._response, str(err))
+
         except OperationFailed:
             raise CloudError(self._response)
 
-        self._thread = None
-        self._done = None
-        self._exception = None
-        if not finished(self.status()):
-            self._done = threading.Event()
-            self._thread = threading.Thread(
-                target=self._start,
-                name="AzureOperationPoller({})".format(uuid.uuid4()),
-                args=(update_cmd,))
-            self._thread.daemon = True
-            self._thread.start()
+    def _poll(self):
+        """Poll status of operation so long as operation is incomplete and
+        we have an endpoint to query.
 
-    def _start(self, update_cmd):
-        """Start the long running operation.
-        On completion, runs any callbacks.
-
-        :param callable update_cmd: The API reuqest to check the status of
-         the operation.
+        :param callable update_cmd: The function to call to retrieve the
+         latest status of the long running operation.
+        :raises: OperationFailed if operation status 'Failed' or 'Cancelled'.
+        :raises: BadStatus if response status invalid.
+        :raises: BadResponse if response invalid.
         """
-        try:
-            self._poll(update_cmd)
 
-        except BadStatus:
-            self._operation.status = 'Failed'
-            self._exception = CloudError(self._response)
+        while not self.finished():
+            self._delay()
+            self.update_status()
 
-        except BadResponse as err:
-            self._operation.status = 'Failed'
-            self._exception = CloudError(self._response, str(err))
+        if failed(self._operation.status):
+            raise OperationFailed("Operation failed or cancelled")
 
-        except OperationFailed:
-            self._exception = CloudError(self._response)
-
-        except Exception as err:
-            self._exception = err
-
-        finally:
-            self._done.set()
-
-        callbacks, self._callbacks = self._callbacks, []
-        while callbacks:
-            for call in callbacks:
-                call(self._operation)
-            callbacks, self._callbacks = self._callbacks, []
+        elif self._operation.should_do_final_get():
+            if self._operation.method == 'POST' and self._operation.location_url:
+                final_get_url = self._operation.location_url
+            else:
+                final_get_url = self._operation.initial_response.request.url
+            self._response = self.request_status(final_get_url)
+            self._operation.parse_resource(self._response)
 
     def _delay(self):
         """Check for a 'retry-after' header to set timeout,
@@ -420,125 +421,35 @@ class AzureOperationPoller(object):
         else:
             time.sleep(self._timeout)
 
-    def _polling_cookie(self):
-        """Collect retry cookie - we only want to do this for the test server
-        at this point, unless we implement a proper cookie policy.
-
-        :returns: Dictionary containing a cookie header if required,
-         otherwise an empty dictionary.
+    def update_status(self):
+        """Update the current status of the LRO.
         """
-        parsed_url = urlparse(self._response.request.url)
-        host = parsed_url.hostname.strip('.')
-        if host == 'localhost':
-            return {'cookie': self._response.headers.get('set-cookie', '')}
-        return {}
+        if self._operation.async_url:
+            self._response = self.request_status(self._operation.async_url)
+            self._operation.set_async_url_if_present(self._response)
+            self._operation.get_status_from_async(self._response)
+        elif self._operation.location_url:
+            self._response = self.request_status(self._operation.location_url)
+            self._operation.set_async_url_if_present(self._response)
+            self._operation.get_status_from_location(self._response)
+        elif self._operation.method == "PUT":
+            initial_url = self._operation.initial_response.request.url
+            self._response = self.request_status(initial_url)
+            self._operation.set_async_url_if_present(self._response)
+            self._operation.get_status_from_resource(self._response)
+        else:
+            raise BadResponse("Unable to find status link for polling.")
 
-    def _poll(self, update_cmd):
-        """Poll status of operation so long as operation is incomplete and
-        we have an endpoint to query.
+    def request_status(self, status_link):
+        """Do a simple GET to this status link.
 
-        :param callable update_cmd: The function to call to retrieve the
-         latest status of the long running operation.
-        :raises: OperationFailed if operation status 'Failed' or 'Cancelled'.
-        :raises: BadStatus if response status invalid.
-        :raises: BadResponse if response invalid.
+        This method re-inject 'x-ms-client-request-id'.
+
+        :rtype: requests.Response
         """
-        initial_url = self._response.request.url
-
-        while not finished(self.status()):
-            self._delay()
-            headers = self._polling_cookie()
-
-            if self._operation.async_url:
-                self._response = update_cmd(
-                    self._operation.async_url, headers)
-                self._operation.set_async_url_if_present(self._response)
-                self._operation.get_status_from_async(
-                    self._response)
-            elif self._operation.location_url:
-                self._response = update_cmd(
-                    self._operation.location_url, headers)
-                self._operation.set_async_url_if_present(self._response)
-                self._operation.get_status_from_location(
-                    self._response)
-            elif self._operation.method == "PUT":
-                self._response = update_cmd(initial_url, headers)
-                self._operation.set_async_url_if_present(self._response)
-                self._operation.get_status_from_resource(
-                    self._response)
-            else:
-                raise BadResponse(
-                    'Location header is missing from long running operation.')
-
-        if failed(self._operation.status):
-            raise OperationFailed("Operation failed or cancelled")
-        elif self._operation.should_do_final_get():
-            self._response = update_cmd(initial_url)
-            self._operation.get_status_from_resource(
-                self._response)
-
-    def status(self):
-        """Returns the current status string.
-
-        :returns: The current status string
-        :rtype: str
-        """
-        return self._operation.status
-
-    def result(self, timeout=None):
-        """Return the result of the long running operation, or
-        the result available after the specified timeout.
-
-        :returns: The deserialized resource of the long running operation,
-         if one is available.
-        :raises CloudError: Server problem with the query.
-        """
-        self.wait(timeout)
-        return self._operation.resource
-
-    def wait(self, timeout=None):
-        """Wait on the long running operation for a specified length
-        of time.
-
-        :param int timeout: Perion of time to wait for the long running
-         operation to complete.
-        :raises ~msrestazure.azure_exceptions.CloudError: Server problem with the query.
-        """
-        if self._thread is None:
-            return
-        self._thread.join(timeout=timeout)
-        try:
-            raise self._exception
-        except TypeError:
-            pass
-
-    def done(self):
-        """Check status of the long running operation.
-
-        :returns: 'True' if the process has completed, else 'False'.
-        """
-        return self._thread is None or not self._thread.isAlive()
-
-    def add_done_callback(self, func):
-        """Add callback function to be run once the long running operation
-        has completed - regardless of the status of the operation.
-
-        :param callable func: Callback function that takes at least one
-         argument, a completed LongRunningOperation.
-        :raises: ValueError if the long running operation has already
-         completed.
-        """
-        if self._done is None or self._done.is_set():
-            raise ValueError("Process is complete.")
-        self._callbacks.append(func)
-
-    def remove_done_callback(self, func):
-        """Remove a callback from the long running operation.
-
-        :param callable func: The function to be removed from the callbacks.
-        :raises: ValueError if the long running operation has already
-         completed.
-        """
-        if self._done is None or self._done.is_set():
-            raise ValueError("Process is complete.")
-        self._callbacks = [c for c in self._callbacks if c != func]
+        request = self._client.get(status_link)
+        # ARM requires to re-inject 'x-ms-client-request-id' while polling
+        header_parameters = {
+            'x-ms-client-request-id': self._operation.initial_response.request.headers['x-ms-client-request-id']
+        }
+        return self._client.send(request, header_parameters, stream=False, **self._operation_config)
