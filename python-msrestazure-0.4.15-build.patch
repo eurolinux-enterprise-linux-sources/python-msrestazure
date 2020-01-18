@@ -1,0 +1,15 @@
+diff -up ./setup.py.orig ./setup.py
+--- ./setup.py.orig	2017-10-14 00:28:46.000000000 +0200
++++ ./setup.py	2017-10-17 21:39:34.719154175 +0200
+@@ -49,8 +49,8 @@ setup(
+         'License :: OSI Approved :: MIT License',
+         'Topic :: Software Development'],
+     install_requires=[
+-        "msrest~=0.4.17",
+-        "keyring>=5.6",
+-        "adal~=0.4.0"
++        "msrest>=0.4.17,<0.5",
++        "keyring",
++        "adal>=0.4.0,<0.5"
+     ],
+ )
