@@ -25,7 +25,7 @@
 
 Name:           python-%{srcname}
 Version:        0.5.1
-Release:        0%{?dist}.1
+Release:        1%{?dist}
 Summary:        %{common_summary}
 
 Group:          System Environment/Libraries
@@ -143,9 +143,9 @@ popd
 
 
 %changelog
-* Thu May 16 2019 Oyvind Albrigtsen <oalbrigt@redhat.com> - 0.5.1-0.1
+* Mon May 13 2019 Oyvind Albrigtsen <oalbrigt@redhat.com> - 0.5.1-1
 - Update to 0.5.1
-  Resolves: rhbz#1709114
+  Resolves: rhbz#1707860
 
 * Thu Jan 25 2018 Oyvind Albrigtsen <oalbrigt@redhat.com> - 0.4.16-3
 - Bundle python-keyring
